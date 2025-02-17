@@ -1,5 +1,8 @@
+import fs from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { expect, test } from 'vitest'
-import { isBuild, isWindows, page } from '~utils'
+import { isBuild, isWindows, page, testDir, viteTestUrl } from '~utils'
 
 test('bom import', async () => {
   expect(await page.textContent('.utf8-bom')).toMatch('[success]')
@@ -108,6 +111,10 @@ test('a ts module can import another ts module using its corresponding js file n
   expect(await page.textContent('.ts-extension')).toMatch('[success]')
 })
 
+test('a js module can import another ts module using its corresponding js file name', async () => {
+  expect(await page.textContent('.js-ts-extension')).toMatch('[success]')
+})
+
 test('filename with dot', async () => {
   expect(await page.textContent('.dot')).toMatch('[success]')
 })
@@ -118,6 +125,10 @@ test.runIf(isWindows)('drive-relative path', async () => {
 
 test('absolute path', async () => {
   expect(await page.textContent('.absolute')).toMatch('[success]')
+})
+
+test('file url', async () => {
+  expect(await page.textContent('.file-url')).toMatch('[success]')
 })
 
 test('browser field', async () => {
@@ -164,6 +175,12 @@ test('resolve.mainFields', async () => {
   expect(await page.textContent('.custom-main-fields')).toMatch('[success]')
 })
 
+test('resolve.mainFields.browser-first', async () => {
+  expect(await page.textContent('.custom-browser-main-field')).toBe(
+    'resolved browser field',
+  )
+})
+
 test('resolve.conditions', async () => {
   expect(await page.textContent('.custom-condition')).toMatch('[success]')
 })
@@ -198,4 +215,44 @@ test('Resolving slash with imports filed', async () => {
 
 test('Resolving from other package with imports field', async () => {
   expect(await page.textContent('.imports-pkg-slash')).toMatch('[success]')
+})
+
+test('Resolving with query with imports field', async () => {
+  // since it is imported with `?url` it should return a URL
+  expect(await page.textContent('.imports-query')).toMatch(
+    isBuild ? /base64/ : '/imports-path/query.json',
+  )
+})
+
+test('Resolve doesnt interrupt page request with trailing query and .css', async () => {
+  await page.goto(viteTestUrl + '/?test.css')
+  expect(await page.locator('vite-error-overlay').count()).toBe(0)
+  expect(await page.textContent('h1')).toBe('Resolve')
+})
+
+test('resolve non-normalized absolute path', async () => {
+  expect(await page.textContent('.non-normalized')).toMatch('[success]')
+})
+
+test.runIf(!isWindows)(
+  'Resolve doesnt interrupt page request that clashes with local project package.json',
+  async () => {
+    // Sometimes request path may point to a different project's package.json, but for testing
+    // we point to Vite's own monorepo which always exists, and the package.json is not a library
+    const pathToViteMonorepoRoot = new URL('../../../', import.meta.url)
+    const urlPath = fileURLToPath(pathToViteMonorepoRoot).replace(/\/$/, '')
+    await page.goto(viteTestUrl + urlPath)
+    expect(await page.locator('vite-error-overlay').count()).toBe(0)
+    expect(await page.textContent('h1')).toBe('Resolve')
+  },
+)
+
+test.runIf(isBuild)('public dir is not copied', async () => {
+  expect(
+    fs.existsSync(path.resolve(testDir, 'dist/should-not-be-copied')),
+  ).toBe(false)
+})
+
+test('import utf8-bom package', async () => {
+  expect(await page.textContent('.utf8-bom-package')).toMatch('[success]')
 })
