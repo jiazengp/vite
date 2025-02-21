@@ -3,13 +3,14 @@ import fs from 'node:fs'
 import { performance } from 'node:perf_hooks'
 import { cac } from 'cac'
 import colors from 'picocolors'
-import type { BuildOptions } from './build'
+import { VERSION } from './constants'
+import type { BuildEnvironmentOptions } from './build'
 import type { ServerOptions } from './server'
+import type { CLIShortcut } from './shortcuts'
 import type { LogLevel } from './logger'
 import { createLogger } from './logger'
-import { VERSION } from './constants'
-import { bindShortcuts } from './shortcuts'
-import { resolveConfig } from '.'
+import { resolveConfig } from './config'
+import type { InlineConfig } from './config'
 
 const cli = cac('vite')
 
@@ -22,6 +23,7 @@ interface GlobalCLIOptions {
   l?: LogLevel
   logLevel?: LogLevel
   clearScreen?: boolean
+  configLoader?: 'bundle' | 'runner' | 'native'
   d?: boolean | string
   debug?: boolean | string
   f?: string
@@ -29,6 +31,11 @@ interface GlobalCLIOptions {
   m?: string
   mode?: string
   force?: boolean
+  w?: boolean
+}
+
+interface BuilderCLIOptions {
+  app?: boolean
 }
 
 let profileSession = global.__vite_profile_session
@@ -70,7 +77,7 @@ const filterDuplicateOptions = <T extends object>(options: T) => {
 /**
  * removing global flags before passing as command specific sub-configs
  */
-function cleanOptions<Options extends GlobalCLIOptions>(
+function cleanGlobalCLIOptions<Options extends GlobalCLIOptions>(
   options: Options,
 ): Omit<Options, keyof GlobalCLIOptions> {
   const ret = { ...options }
@@ -81,20 +88,75 @@ function cleanOptions<Options extends GlobalCLIOptions>(
   delete ret.l
   delete ret.logLevel
   delete ret.clearScreen
+  delete ret.configLoader
   delete ret.d
   delete ret.debug
   delete ret.f
   delete ret.filter
   delete ret.m
   delete ret.mode
+  delete ret.w
+
+  // convert the sourcemap option to a boolean if necessary
+  if ('sourcemap' in ret) {
+    const sourcemap = ret.sourcemap as `${boolean}` | 'inline' | 'hidden'
+    ret.sourcemap =
+      sourcemap === 'true'
+        ? true
+        : sourcemap === 'false'
+          ? false
+          : ret.sourcemap
+  }
+  if ('watch' in ret) {
+    const watch = ret.watch
+    ret.watch = watch ? {} : undefined
+  }
+
   return ret
+}
+
+/**
+ * removing builder flags before passing as command specific sub-configs
+ */
+function cleanBuilderCLIOptions<Options extends BuilderCLIOptions>(
+  options: Options,
+): Omit<Options, keyof BuilderCLIOptions> {
+  const ret = { ...options }
+  delete ret.app
+  return ret
+}
+
+/**
+ * host may be a number (like 0), should convert to string
+ */
+const convertHost = (v: any) => {
+  if (typeof v === 'number') {
+    return String(v)
+  }
+  return v
+}
+
+/**
+ * base may be a number (like 0), should convert to empty string
+ */
+const convertBase = (v: any) => {
+  if (v === 0) {
+    return ''
+  }
+  return v
 }
 
 cli
   .option('-c, --config <file>', `[string] use specified config file`)
-  .option('--base <path>', `[string] public base path (default: /)`)
+  .option('--base <path>', `[string] public base path (default: /)`, {
+    type: [convertBase],
+  })
   .option('-l, --logLevel <level>', `[string] info | warn | error | silent`)
   .option('--clearScreen', `[boolean] allow/disable clear screen when logging`)
+  .option(
+    '--configLoader <loader>',
+    `[string] use 'bundle' to bundle the config with esbuild, or 'runner' (experimental) to process it on the fly, or 'native' (experimental) to load using the native runtime (default: bundle)`,
+  )
   .option('-d, --debug [feat]', `[string | boolean] show debug logs`)
   .option('-f, --filter <filter>', `[string] filter debug logs`)
   .option('-m, --mode <mode>', `[string] set env mode`)
@@ -104,9 +166,8 @@ cli
   .command('[root]', 'start dev server') // default command
   .alias('serve') // the command is called 'serve' in Vite's API
   .alias('dev') // alias to align with the script name
-  .option('--host [host]', `[string] specify hostname`)
+  .option('--host [host]', `[string] specify hostname`, { type: [convertHost] })
   .option('--port <port>', `[number] specify port`)
-  .option('--https', `[boolean] use TLS + HTTP/2`)
   .option('--open [path]', `[boolean | string] open browser on startup`)
   .option('--cors', `[boolean] enable CORS`)
   .option('--strictPort', `[boolean] exit if specified port is already in use`)
@@ -125,10 +186,11 @@ cli
         base: options.base,
         mode: options.mode,
         configFile: options.config,
+        configLoader: options.configLoader,
         logLevel: options.logLevel,
         clearScreen: options.clearScreen,
-        optimizeDeps: { force: options.force },
-        server: cleanOptions(options),
+        server: cleanGlobalCLIOptions(options),
+        forceOptimizeDeps: options.force,
       })
 
       if (!server.httpServer) {
@@ -139,6 +201,10 @@ cli
 
       const info = server.config.logger.info
 
+      const modeString =
+        options.mode && options.mode !== 'development'
+          ? `  ${colors.bgGreen(` ${colors.bold(options.mode)} `)}`
+          : ''
       const viteStartTime = global.__vite_start_time ?? false
       const startupDurationString = viteStartTime
         ? colors.dim(
@@ -147,43 +213,46 @@ cli
             )} ms`,
           )
         : ''
+      const hasExistingLogs =
+        process.stdout.bytesWritten > 0 || process.stderr.bytesWritten > 0
 
       info(
         `\n  ${colors.green(
           `${colors.bold('VITE')} v${VERSION}`,
-        )}  ${startupDurationString}\n`,
-        { clear: !server.config.logger.hasWarned },
+        )}${modeString}  ${startupDurationString}\n`,
+        {
+          clear: !hasExistingLogs,
+        },
       )
 
       server.printUrls()
-      bindShortcuts(server, {
-        print: true,
-        customShortcuts: [
-          profileSession && {
-            key: 'p',
-            description: 'start/stop the profiler',
-            async action(server) {
-              if (profileSession) {
-                await stopProfiler(server.config.logger.info)
-              } else {
-                const inspector = await import('node:inspector').then(
-                  (r) => r.default,
-                )
-                await new Promise<void>((res) => {
-                  profileSession = new inspector.Session()
-                  profileSession.connect()
-                  profileSession.post('Profiler.enable', () => {
-                    profileSession!.post('Profiler.start', () => {
-                      server.config.logger.info('Profiler started')
-                      res()
-                    })
+      const customShortcuts: CLIShortcut<typeof server>[] = []
+      if (profileSession) {
+        customShortcuts.push({
+          key: 'p',
+          description: 'start/stop the profiler',
+          async action(server) {
+            if (profileSession) {
+              await stopProfiler(server.config.logger.info)
+            } else {
+              const inspector = await import('node:inspector').then(
+                (r) => r.default,
+              )
+              await new Promise<void>((res) => {
+                profileSession = new inspector.Session()
+                profileSession.connect()
+                profileSession.post('Profiler.enable', () => {
+                  profileSession!.post('Profiler.start', () => {
+                    server.config.logger.info('Profiler started')
+                    res()
                   })
                 })
-              }
-            },
+              })
+            }
           },
-        ],
-      })
+        })
+      }
+      server.bindCLIShortcuts({ print: true, customShortcuts })
     } catch (e) {
       const logger = createLogger(options.logLevel)
       logger.error(colors.red(`error when starting dev server:\n${e.stack}`), {
@@ -223,44 +292,55 @@ cli
   .option('--manifest [name]', `[boolean | string] emit build manifest json`)
   .option('--ssrManifest [name]', `[boolean | string] emit ssr manifest json`)
   .option(
-    '--force',
-    `[boolean] force the optimizer to ignore the cache and re-bundle (experimental)`,
-  )
-  .option(
     '--emptyOutDir',
     `[boolean] force empty outDir when it's outside of root`,
   )
   .option('-w, --watch', `[boolean] rebuilds when modules have changed on disk`)
-  .action(async (root: string, options: BuildOptions & GlobalCLIOptions) => {
-    filterDuplicateOptions(options)
-    const { build } = await import('./build')
-    const buildOptions: BuildOptions = cleanOptions(options)
+  .option('--app', `[boolean] same as \`builder: {}\``)
+  .action(
+    async (
+      root: string,
+      options: BuildEnvironmentOptions & BuilderCLIOptions & GlobalCLIOptions,
+    ) => {
+      filterDuplicateOptions(options)
+      const { createBuilder } = await import('./build')
 
-    try {
-      await build({
-        root,
-        base: options.base,
-        mode: options.mode,
-        configFile: options.config,
-        logLevel: options.logLevel,
-        clearScreen: options.clearScreen,
-        optimizeDeps: { force: options.force },
-        build: buildOptions,
-      })
-    } catch (e) {
-      createLogger(options.logLevel).error(
-        colors.red(`error during build:\n${e.stack}`),
-        { error: e },
+      const buildOptions: BuildEnvironmentOptions = cleanGlobalCLIOptions(
+        cleanBuilderCLIOptions(options),
       )
-      process.exit(1)
-    } finally {
-      stopProfiler((message) => createLogger(options.logLevel).info(message))
-    }
-  })
+
+      try {
+        const inlineConfig: InlineConfig = {
+          root,
+          base: options.base,
+          mode: options.mode,
+          configFile: options.config,
+          configLoader: options.configLoader,
+          logLevel: options.logLevel,
+          clearScreen: options.clearScreen,
+          build: buildOptions,
+          ...(options.app ? { builder: {} } : {}),
+        }
+        const builder = await createBuilder(inlineConfig, null)
+        await builder.buildApp()
+      } catch (e) {
+        createLogger(options.logLevel).error(
+          colors.red(`error during build:\n${e.stack}`),
+          { error: e },
+        )
+        process.exit(1)
+      } finally {
+        stopProfiler((message) => createLogger(options.logLevel).info(message))
+      }
+    },
+  )
 
 // optimize
 cli
-  .command('optimize [root]', 'pre-bundle dependencies')
+  .command(
+    'optimize [root]',
+    'pre-bundle dependencies (deprecated, the pre-bundle process runs automatically and does not need to be called)',
+  )
   .option(
     '--force',
     `[boolean] force the optimizer to ignore the cache and re-bundle`,
@@ -275,6 +355,7 @@ cli
             root,
             base: options.base,
             configFile: options.config,
+            configLoader: options.configLoader,
             logLevel: options.logLevel,
             mode: options.mode,
           },
@@ -291,12 +372,12 @@ cli
     },
   )
 
+// preview
 cli
   .command('preview [root]', 'locally preview production build')
-  .option('--host [host]', `[string] specify hostname`)
+  .option('--host [host]', `[string] specify hostname`, { type: [convertHost] })
   .option('--port <port>', `[number] specify port`)
   .option('--strictPort', `[boolean] exit if specified port is already in use`)
-  .option('--https', `[boolean] use TLS + HTTP/2`)
   .option('--open [path]', `[boolean | string] open browser on startup`)
   .option('--outDir <dir>', `[string] output directory (default: dist)`)
   .action(
@@ -305,7 +386,6 @@ cli
       options: {
         host?: string | boolean
         port?: number
-        https?: boolean
         open?: boolean | string
         strictPort?: boolean
         outDir?: string
@@ -318,6 +398,7 @@ cli
           root,
           base: options.base,
           configFile: options.config,
+          configLoader: options.configLoader,
           logLevel: options.logLevel,
           mode: options.mode,
           build: {
@@ -327,11 +408,11 @@ cli
             port: options.port,
             strictPort: options.strictPort,
             host: options.host,
-            https: options.https,
             open: options.open,
           },
         })
         server.printUrls()
+        server.bindCLIShortcuts({ print: true })
       } catch (e) {
         createLogger(options.logLevel).error(
           colors.red(`error when starting preview server:\n${e.stack}`),

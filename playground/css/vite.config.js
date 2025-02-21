@@ -1,4 +1,5 @@
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 import stylus from 'stylus'
 import { defineConfig } from 'vite'
 
@@ -9,11 +10,55 @@ globalThis.window = {}
 // @ts-expect-error refer to https://github.com/vitejs/vite/pull/11079
 globalThis.location = new URL('http://localhost/')
 
-/** @type {import('vite').UserConfig} */
-// @ts-expect-error typecast
 export default defineConfig({
+  plugins: [
+    {
+      // Emulate a UI framework component where a framework module would import
+      // scoped CSS files that should treeshake if the default export is not used.
+      name: 'treeshake-scoped-css',
+      enforce: 'pre',
+      async resolveId(id, importer) {
+        if (!importer || !id.endsWith('-scoped.css')) return
+
+        const resolved = await this.resolve(id, importer)
+        if (!resolved) return
+
+        return {
+          ...resolved,
+          meta: {
+            vite: {
+              cssScopeTo: [
+                importer,
+                resolved.id.includes('barrel') ? undefined : 'default',
+              ],
+            },
+          },
+        }
+      },
+    },
+  ],
   build: {
     cssTarget: 'chrome61',
+    rollupOptions: {
+      input: {
+        index: path.resolve(__dirname, './index.html'),
+        treeshakeScoped: path.resolve(
+          __dirname,
+          './treeshake-scoped/index.html',
+        ),
+        treeshakeScopedAnother: path.resolve(
+          __dirname,
+          './treeshake-scoped/another.html',
+        ),
+      },
+      output: {
+        manualChunks(id) {
+          if (id.includes('manual-chunk.css')) {
+            return 'dir/dir2/manual-chunk'
+          }
+        },
+      },
+    },
   },
   esbuild: {
     logOverride: {
@@ -54,12 +99,32 @@ export default defineConfig({
     preprocessorOptions: {
       scss: {
         additionalData: `$injectedColor: orange;`,
-        importer: [
-          function (url) {
-            return url === 'virtual-dep' ? { contents: '' } : null
+        importers: [
+          {
+            canonicalize(url) {
+              return url === 'virtual-dep' || url.endsWith('.wxss')
+                ? new URL('custom-importer:virtual-dep')
+                : null
+            },
+            load() {
+              return {
+                contents: ``,
+                syntax: 'scss',
+              }
+            },
           },
-          function (url) {
-            return url.endsWith('.wxss') ? { contents: '' } : null
+          {
+            canonicalize(url) {
+              return url === 'virtual-file-absolute'
+                ? new URL('custom-importer:virtual-file-absolute')
+                : null
+            },
+            load() {
+              return {
+                contents: `@use "${pathToFileURL(path.join(import.meta.dirname, 'file-absolute.scss')).href}"`,
+                syntax: 'scss',
+              }
+            },
           },
         ],
       },
@@ -75,5 +140,6 @@ export default defineConfig({
         },
       },
     },
+    preprocessorMaxWorkers: true,
   },
 })
